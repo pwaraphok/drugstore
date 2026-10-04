@@ -1,0 +1,421 @@
+# Pharmacy Management System (PMS) - System Architecture & Blueprint
+
+เอกสารออกแบบสถาปัตยกรรมและโครงสร้างระบบบริหารจัดการร้านขายยาแบบครบวงจร (Enterprise Standard) ครอบคลุมงานขายหน้าร้าน (POS), การจัดการสต็อกและล็อตยา (FEFO), ความปลอดภัยของผู้ป่วย (Clinical Engine), มาตรฐาน อย. (GPP Compliance) และระบบพิมพ์/สแกนบาร์โค้ด (Barcode Ecosystem)
+
+---
+
+## 📋 Table of Contents
+1. [Overall System Architecture](#1-overall-system-architecture)
+2. [Database Schema & FEFO Engine](#2-database-schema--fefo-engine)
+3. [Core POS & Real-time Label Printing](#3-core-pos--real-time-label-printing)
+4. [Patient Safety & Clinical Check Engine](#4-patient-safety--clinical-check-engine)
+5. [GPP Compliance & Regulatory Module](#5-gpp-compliance--regulatory-module)
+6. [Barcode & QR Code Ecosystem](#6-barcode--qr-code-ecosystem)
+
+---
+
+## 1. Overall System Architecture
+
+### Tech Stack Definition
+* **Frontend Framework:** Next.js (TypeScript, React, Tailwind CSS)
+* **Backend Framework:** NestJS (TypeScript, REST API, WebSockets, Swagger)
+* **Database:** MariaDB / MySQL (3NF Normalized Schema, InnoDB Engine)
+* **ORM:** TypeORM / Prisma
+* **Hardware Integration:** Web Print API / Thermal Printers (ESC/POS), USB/Bluetooth Barcode Scanners (HID Mode)
+
+[ Barcode Scanner / POS Interface (Next.js) ]
+│
+▼  (REST API / HTTPS)
+[ NestJS API Gateway & Controllers ]
+├── Sales Controller
+├── Inventory & FEFO Controller
+├── Clinical Safety Controller (Allergy & Interaction Engine)
+└── Regulatory / GPP Controller
+│
+▼  (ACID Transactions / Row-Level Locks)
+[ MariaDB Database (Products, Lots, Sales, Patients, GPP Views) ]
+
+---
+
+## 2. Database Schema & FEFO Engine
+
+### 2.1 MariaDB Database Schema (3NF)
+
+```sql
+-- 1. ตารางข้อมูลยาและสินค้าหลัก
+CREATE TABLE products (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sku VARCHAR(50) UNIQUE NOT NULL,
+    barcode VARCHAR(50) UNIQUE,
+    trade_name VARCHAR(255) NOT NULL,
+    generic_name VARCHAR(255) NOT NULL,
+    category VARCHAR(100),
+    unit_concept VARCHAR(50) NOT NULL COMMENT 'เช่น เม็ด, ขวด, แผง',
+    unit_price DECIMAL(10,2) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_products_barcode (barcode),
+    INDEX idx_products_generic (generic_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 2. ตารางจัดการล็อตยาและวันหมดอายุ (FEFO Tracking)
+CREATE TABLE product_lots (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    product_id BIGINT NOT NULL,
+    lot_number VARCHAR(100) NOT NULL,
+    lot_barcode VARCHAR(100) UNIQUE,
+    manufacture_date DATE,
+    expiration_date DATE NOT NULL,
+    quantity_remaining INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+    INDEX idx_lots_fefo (product_id, expiration_date, quantity_remaining),
+    INDEX idx_product_lots_barcode (lot_barcode)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 3. ตารางประวัติการแพ้ยาของผู้ป่วย
+CREATE TABLE patient_allergies (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    patient_id BIGINT NOT NULL,
+    product_id BIGINT NULL,
+    generic_name VARCHAR(255) NULL,
+    symptom TEXT,
+    severity ENUM('MILD', 'MODERATE', 'SEVERE') DEFAULT 'MODERATE',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_patient_allergies (patient_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 4. ตารางคู่อันตรกิริยาระหว่างยา (Drug-Drug Interactions)
+CREATE TABLE drug_interactions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    generic_name_a VARCHAR(255) NOT NULL,
+    generic_name_b VARCHAR(255) NOT NULL,
+    severity_level ENUM('CONTRAINDICATED', 'MAJOR', 'MODERATE', 'MINOR') NOT NULL,
+    description TEXT,
+    recommendation TEXT,
+    INDEX idx_interaction_lookup (generic_name_a, generic_name_b)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 5. ตารางธุรกรรมการขาย (Sales Order)
+CREATE TABLE sales (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    invoice_number VARCHAR(50) UNIQUE NOT NULL,
+    patient_id BIGINT NULL,
+    pharmacist_id BIGINT NOT NULL,
+    total_amount DECIMAL(10,2) NOT NULL,
+    payment_method ENUM('CASH', 'PROMPTPAY', 'CREDIT_CARD') NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 6. ตารางรายการสินค้าในบิลขาย (ผูกกับ Lot และ Pharmacist สำหรับ GPP)
+CREATE TABLE sale_items (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sale_id BIGINT NOT NULL,
+    product_id BIGINT NOT NULL,
+    lot_id BIGINT NOT NULL,
+    quantity INT NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    total_price DECIMAL(10,2) NOT NULL,
+    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id),
+    FOREIGN KEY (lot_id) REFERENCES product_lots(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+2.2 FEFO Allocation Logic (NestJS Service)
+
+// inventory.service.ts
+import { Injectable, BadRequestException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { ProductLot } from './entities/product-lot.entity';
+
+@Injectable()
+export class InventoryService {
+  constructor(private dataSource: DataSource) {}
+
+  async allocateStockFEFO(productId: number, requiredQty: number) {
+    return await this.dataSource.transaction(async (manager) => {
+      // ดึงล็อตที่ยังไม่หมดอายุ และเรียงลำดับจากวันหมดอายุเร็วที่สุด (Pessimistic Lock)
+      const availableLots = await manager
+        .createQueryBuilder(ProductLot, 'lot')
+        .setLock('pessimistic_write')
+        .where('lot.product_id = :productId', { productId })
+        .andWhere('lot.quantity_remaining > 0')
+        .andWhere('lot.expiration_date > CURRENT_DATE()')
+        .orderBy('lot.expiration_date', 'ASC')
+        .getMany();
+
+      const totalStock = availableLots.reduce((sum, lot) => sum + lot.quantity_remaining, 0);
+      if (totalStock < requiredQty) {
+        throw new BadRequestException(`สินค้าไม่พอขาย (ต้องการ: ${requiredQty}, คงเหลือ: ${totalStock})`);
+      }
+
+      let remainingToDeduct = requiredQty;
+      const allocations = [];
+
+      for (const lot of availableLots) {
+        if (remainingToDeduct <= 0) break;
+
+        const deductQty = Math.min(lot.quantity_remaining, remainingToDeduct);
+        lot.quantity_remaining -= deductQty;
+        remainingToDeduct -= deductQty;
+
+        await manager.save(lot);
+
+        allocations.push({
+          lotId: lot.id,
+          lotNumber: lot.lot_number,
+          expirationDate: lot.expiration_date,
+          allocatedQuantity: deductQty,
+        });
+      }
+
+      return allocations;
+    });
+  }
+}
+
+3. Core POS & Real-time Label Printing
+Thermal Prescription Label Component (Next.js - Size 80x50mm)
+
+// components/pos/PrescriptionLabel.tsx
+import React from 'react';
+
+interface LabelProps {
+  patientName: string;
+  drugTradeName: string;
+  drugGenericName: string;
+  usageInstructions: string;
+  warningNote?: string;
+  dispensedDate: string;
+  pharmacistName: string;
+}
+
+export const PrescriptionLabel: React.FC<LabelProps> = ({
+  patientName,
+  drugTradeName,
+  drugGenericName,
+  usageInstructions,
+  warningNote,
+  dispensedDate,
+  pharmacistName,
+}) => {
+  return (
+    <div className="w-[80mm] h-[50mm] p-2 bg-white text-black font-sans border border-black flex flex-col justify-between print:border-none print:m-0">
+      <div>
+        <div className="flex justify-between items-center border-b border-black pb-1 mb-1">
+          <span className="font-bold text-xs truncate">ผู้ป่วย: {patientName}</span>
+          <span className="text-[9px]">{dispensedDate}</span>
+        </div>
+        <div className="font-bold text-sm leading-tight">{drugTradeName}</div>
+        <div className="text-[10px] text-gray-700 italic border-b border-gray-300 pb-1 mb-1">
+          ({drugGenericName})
+        </div>
+        <div className="text-xs font-semibold my-1">{usageInstructions}</div>
+      </div>
+      
+      <div>
+        {warningNote && (
+          <div className="text-[9px] font-bold text-red-600 border-t border-dashed border-black pt-0.5">
+            คำเตือน: {warningNote}
+          </div>
+        )}
+        <div className="flex justify-between items-end border-t border-black pt-1 text-[8px]">
+          <span>ร้านขายยาคุ้มครองผู้บริโภค</span>
+          <span>เภสัชกรผู้ส่งมอบ: {pharmacistName}</span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+
+4. Patient Safety & Clinical Check Engine
+Clinical Alert Checker (NestJS Service)
+
+// clinical.service.ts
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, In } from 'typeorm';
+import { PatientAllergy } from './entities/patient-allergy.entity';
+import { DrugInteraction } from './entities/drug-interaction.entity';
+import { Product } from '../inventory/entities/product.entity';
+
+@Injectable()
+export class ClinicalService {
+  constructor(
+    @InjectRepository(PatientAllergy) private allergyRepo: Repository<PatientAllergy>,
+    @InjectRepository(DrugInteraction) private interactionRepo: Repository<DrugInteraction>,
+    @InjectRepository(Product) private productRepo: Repository<Product>,
+  ) {}
+
+  async checkSafety(patientId: number, productIdsInCart: number[]) {
+    const cartProducts = await this.productRepo.findBy({ id: In(productIdsInCart) });
+    const warnings = [];
+
+    // 1. Check Drug Allergy (ตรวจประวัติแพ้ยา)
+    if (patientId) {
+      const patientAllergies = await this.allergyRepo.findBy({ patientId });
+      for (const product of cartProducts) {
+        const isAllergic = patientAllergies.some(
+          a => a.productId === product.id || a.genericName.toLowerCase() === product.generic_name.toLowerCase()
+        );
+        if (isAllergic) {
+          warnings.push({
+            type: 'ALLERGY_ALERT',
+            severity: 'CRITICAL',
+            message: `ผู้ป่วยมีประวัติแพ้ยา: ${product.trade_name} (${product.generic_name})`,
+          });
+        }
+      }
+    }
+
+    // 2. Check Drug-Drug Interactions (ตรวจอันตรกิริยาระหว่างยา)
+    const genericNames = cartProducts.map(p => p.generic_name);
+    for (let i = 0; i < genericNames.length; i++) {
+      for (let j = i + 1; j < genericNames.length; j++) {
+        const interaction = await this.interactionRepo.findOne({
+          where: [
+            { generic_name_a: genericNames[i], generic_name_b: genericNames[j] },
+            { generic_name_a: genericNames[j], generic_name_b: genericNames[i] },
+          ],
+        });
+
+        if (interaction) {
+          warnings.push({
+            type: 'INTERACTION_ALERT',
+            severity: interaction.severity_level,
+            message: `พบปฏิกิริยาระหว่างยา: ${genericNames[i]} + ${genericNames[j]} (${interaction.description})`,
+            recommendation: interaction.recommendation,
+          });
+        }
+      }
+    }
+
+    return { isSafe: warnings.length === 0, warnings };
+  }
+}
+
+5. GPP Compliance & Regulatory Module
+GPP SQL Views สำหรับออกรายงาน (ข.ย. 9, 10, 11, 12)
+
+-- View สำหรับรายงาน ข.ย. 11 (บัญชีขายนัยสำคัญ/ยาควบคุมพิเศษ)
+CREATE VIEW view_gpp_khoyor_11 AS
+SELECT 
+    s.created_at AS sale_timestamp,
+    s.invoice_number,
+    p.trade_name,
+    p.generic_name,
+    pl.lot_number,
+    pl.expiration_date,
+    si.quantity,
+    p.unit_concept,
+    s.patient_id,
+    s.pharmacist_id
+FROM sale_items si
+JOIN sales s ON si.sale_id = s.id
+JOIN products p ON si.product_id = p.id
+JOIN product_lots pl ON si.lot_id = pl.id
+WHERE p.category IN ('DANGEROUS_DRUG', 'SPECIALLY_CONTROLLED_DRUG')
+ORDER BY s.created_at DESC;
+
+6. Barcode & QR Code Ecosystem
+6.1 Global Barcode Scanner Handler (Next.js Listener)
+
+// components/pos/BarcodeScannerHandler.tsx
+import { useEffect, useRef } from 'react';
+
+interface Props {
+  onScan: (scannedCode: string) => void;
+}
+
+export const BarcodeScannerHandler = ({ onScan }: Props) => {
+  const bufferRef = useRef<string>('');
+  const lastKeyTimeRef = useRef<number>(0);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const currentTime = Date.now();
+      
+      // เครื่องสแกนบาร์โค้ดจะส่งอักขระเร็วกว่ามนุษย์พิมพ์ (< 30-50ms)
+      if (currentTime - lastKeyTimeRef.current > 50) {
+        bufferRef.current = '';
+      }
+
+      if (e.key === 'Enter') {
+        if (bufferRef.current.length >= 3) {
+          onScan(bufferRef.current);
+          bufferRef.current = '';
+        }
+      } else if (e.key.length === 1) {
+        bufferRef.current += e.key;
+      }
+
+      lastKeyTimeRef.current = currentTime;
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onScan]);
+
+  return null;
+};
+
+6.2 Barcode Label Generator Component (JsBarcode / CODE128)
+
+// components/barcode/BarcodeSticker.tsx
+import React, { useEffect, useRef } from 'react';
+import JsBarcode from 'jsbarcode';
+
+interface StickerProps {
+  productName: string;
+  genericName?: string;
+  barcodeValue: string;
+  price: number;
+  expDate?: string;
+}
+
+export const BarcodeSticker: React.FC<StickerProps> = ({
+  productName,
+  genericName,
+  barcodeValue,
+  price,
+  expDate,
+}) => {
+  const barcodeRef = useRef<SVGSVGElement>(null);
+
+  useEffect(() => {
+    if (barcodeRef.current) {
+      JsBarcode(barcodeRef.current, barcodeValue, {
+        format: 'CODE128',
+        width: 1.5,
+        height: 35,
+        displayValue: true,
+        fontSize: 10,
+        margin: 2,
+      });
+    }
+  }, [barcodeValue]);
+
+  return (
+    <div className="sticker-label w-[50mm] h-[30mm] p-1 border border-gray-300 flex flex-col justify-between text-black bg-white print:border-none print:m-0">
+      <div className="text-[9px] font-bold truncate leading-tight">
+        {productName}
+      </div>
+      {genericName && (
+        <div className="text-[7px] text-gray-600 truncate leading-none">
+          ({genericName})
+        </div>
+      )}
+      
+      <div className="flex justify-center items-center my-0.5">
+        <svg ref={barcodeRef}></svg>
+      </div>
+
+      <div className="flex justify-between items-end text-[8px] font-semibold">
+        <span>{expDate ? `EXP: ${expDate}` : ''}</span>
+        <span className="text-[10px] font-extrabold">{price.toFixed(2)} ฿</span>
+      </div>
+    </div>
+  );
+};
+

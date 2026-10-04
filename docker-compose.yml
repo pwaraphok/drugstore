@@ -1,0 +1,41 @@
+services:
+  mariadb:
+    image: mariadb:11.4
+    container_name: drugstore-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: drugstore
+      MARIADB_USER: drugstore
+      MARIADB_PASSWORD: drugstore
+    ports:
+      - "127.0.0.1:3307:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-lock-wait-timeout=5
+      - --binlog-format=ROW
+    volumes:
+      - drugstore_mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: drugstore-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: drugstore
+      MINIO_ROOT_PASSWORD: drugstore-secret
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - drugstore_minio:/data
+
+volumes:
+  drugstore_mariadb:
+  drugstore_minio:

@@ -1,0 +1,27 @@
+  async clinicalCheck(user: AuthUser, saleId: string) {
+    return this.dataSource.transaction(async em => {
+      const sale=await em.findOneOrFail(Sale,{where:{id:saleId,branchId:user.branchId},lock:{mode:'pessimistic_write'}});
+      const items=await em.find(SaleItem,{where:{saleId}});
+      if(!items.length) throw new UnprocessableEntityException('บิลไม่มีสินค้า');
+      const kv=await em.findOne(KnowledgeVersion,{where:{},order:{id:'DESC'}});
+      const patient=sale.patientId?await em.findOneOrFail(Patient,{where:{id:sale.patientId,branchId:user.branchId},lock:{mode:'pessimistic_read'}}):null;
+      const allergies=patient?await em.find(PatientAllergy,{where:{patientId:String(patient.id)}}):[];
+      const meds=patient?await em.find(PatientMedication,{where:{patientId:String(patient.id),activeStatus:true}}):[];
+      const ids=[...new Set([...items.map(i=>i.productId),...meds.map(m=>m.productId).filter((x):x is string=>Boolean(x))])];
+      const ingredients=await em.find(ProductIngredient,{where:ids.map(productId=>({productId}))});
+      const memberships=await em.find(IngredientClassMembership);
+      const rules=kv?await em.find(KnowledgeRule,{where:{knowledgeVersionId:String(kv.id)}}):[];
+      const missing=['ฐานความรู้ยังไม่รับรองสำหรับใช้งานจริง: ต้องประเมินด้วยเภสัชกร'];
+      if(!patient) missing.push('ไม่ได้ระบุผู้ป่วย');
+      if(patient && ['UNKNOWN','NOT_ASKED'].includes(patient.allergyStatus)) missing.push('ยังไม่ยืนยันประวัติแพ้ยา');
+      if(allergies.some(a=>!a.ingredientId&&!a.productId&&!a.drugClassId)) missing.push('ประวัติแพ้ยาที่ยังจับคู่ไม่ได้');
+      if(items.some(i=>!ingredients.some(p=>p.productId===i.productId))) missing.push('สินค้าไม่มีข้อมูลสารสำคัญครบ');
+      if(meds.some(m=>!m.productId&&!m.ingredientId)) missing.push('ประวัติยาปัจจุบันที่จับคู่ไม่ได้');
+      const check=await em.save(em.create(ClinicalCheck,{saleId,cartVersion:sale.cartVersion,patientRecordVersion:patient?.recordVersion||0,inputHash:this.inputHash(sale,items,patient),knowledgeVersion:kv?.version||'NONE',executionStatus:'COMPLETED',coverageStatus:'PARTIAL',assessedAt:new Date(),missingInputs:missing}));
+      const evaluated=evaluateSafety({products:items.map(i=>({id:i.productId,ingredientIds:ingredients.filter(p=>p.productId===i.productId).map(p=>p.ingredientId)})),allergies,memberships,medicationIngredients:meds.flatMap(m=>m.ingredientId?[m.ingredientId]:ingredients.filter(p=>p.productId===m.productId).map(p=>p.ingredientId)),rules});
+      evaluated.push({ruleId:null,severity:'REVIEW',suggestedAction:'REQUIRE_PHARMACIST_REVIEW',message:missing.join(' • '),evidenceReference:null});
+      const alerts=await em.save(evaluated.map(a=>em.create(ClinicalAlert,{...a,checkId:String(check.id)})));
+      return {check,alerts,display:'ข้อมูลตรวจอัตโนมัติยังไม่ครบ ต้องให้เภสัชกรประเมินและบันทึกแหล่งข้อมูลก่อนจ่าย'};
+    });
+  }
+

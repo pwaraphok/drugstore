@@ -1,0 +1,31 @@
+{
+  "name": "drugstore",
+  "private": true,
+  "version": "2.0.0",
+  "description": "Pharmacy management system (drugstore.v2)",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "node scripts/start.cjs --dev",
+    "dev:api": "npm run start:dev -w api",
+    "dev:web": "npm run dev -w web",
+    "build": "npm run build --workspaces --if-present",
+    "seed": "npm run seed -w api",
+    "typeorm": "npm run typeorm -w api",
+    "start": "node scripts/start.cjs",
+    "test": "node --test scripts/integration.cjs",
+    "backup": "node scripts/backup.cjs",
+    "backup:verify": "node scripts/verify-backup.cjs",
+    "migrate": "npm run typeorm -w api -- migration:run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "overrides": {
+    "@nestjs/swagger": {
+      "js-yaml": "5.4.2"
+    }
+  }
+}
